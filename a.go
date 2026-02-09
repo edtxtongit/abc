@@ -50,7 +50,7 @@ func main() {
 		defer c.Close(websocket.StatusNormalClosure, "done")
 
 		fmt.Println("📡 WS1 已连接，发送 start...")
-		wsjson.Write(ctx, c, "start")
+		c.Write(ctx, websocket.MessageText, []byte("start"))
 
 		var res interface{}
 		wsjson.Read(ctx, c, &res)
@@ -84,7 +84,7 @@ func main() {
 		defer c.Close(websocket.StatusNormalClosure, "")
 
 		fmt.Println("📡 WS2 已连接，发送 check...")
-		wsjson.Write(ctx, c, "check")
+		c.Write(ctx, websocket.MessageText, []byte("check"))
 
 		var res interface{}
 		if err := wsjson.Read(ctx, c, &res); err == nil {
