@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"flag"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -13,85 +15,80 @@ import (
 )
 
 func main() {
-	// 1. 配置支持 HTTP/2 的自定义 Transport
-	// 必须强制开启 TLS，因为 H2 几乎只在 HTTPS 上运行
-	t := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-	}
-	// 确保启用 HTTP/2
-	// http2.ConfigureTransport(t) // 默认标准库已经支持
+	targetURL := flag.String("url", "", "Cloudflare Worker URL")
+	flag.Parse()
 
+	if *targetURL == "" {
+		fmt.Println("❌ 请提供 -url 参数")
+		return
+	}
+
+	url := strings.TrimRight(*targetURL, "/")
 	hc := &http.Client{
-		Transport: t,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			ForceAttemptHTTP2: true, // 强制尝试 H2
+		},
 	}
-
-	// 你的 Cloudflare Worker 地址
-	baseURL := "https://polished-scene-73d0.edtxtg.workers.dev"
 
 	var wg sync.WaitGroup
+	// 用于通知 WS1：WS2 已经检查完毕，你可以关了
+	doneSignal := make(chan struct{})
+
 	wg.Add(2)
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
-	defer cancel()
-
-	// --- 任务 1: 连接 /ws1 并发送 start ---
+	// --- WS1: 建立连接并维持 ---
 	go func() {
 		defer wg.Done()
-		opts := &websocket.DialOptions{
-			HTTPClient: hc, // 关键：使用同一个 HTTP Client 以复用 H2 连接
-		}
-		
-		c, _, err := websocket.Dial(ctx, baseURL+"/ws1", opts)
+		ctx := context.Background()
+		c, _, err := websocket.Dial(ctx, url+"/ws1", &websocket.DialOptions{HTTPClient: hc})
 		if err != nil {
 			fmt.Printf("❌ WS1 连接失败: %v\n", err)
 			return
 		}
-		defer c.Close(websocket.StatusNormalClosure, "")
+		// 确保最后关闭
+		defer c.Close(websocket.StatusNormalClosure, "done")
 
-		// 发送 start 信号触发 TCP 连接
-		err = c.Write(ctx, websocket.MessageText, []byte("start"))
-		if err != nil {
-			fmt.Printf("❌ WS1 发送失败: %v\n", err)
-			return
-		}
+		fmt.Println("📡 WS1 已连接，发送 start...")
+		wsjson.Write(ctx, c, "start")
 
-		// 读取返回的 instanceId
-		var v interface{}
-		err = wsjson.Read(ctx, c, &v)
-		if err == nil {
-			fmt.Printf("✅ WS1 响应: %v\n", v)
+		var res interface{}
+		wsjson.Read(ctx, c, &res)
+		fmt.Printf("✅ WS1 初始响应: %v\n", res)
+
+		fmt.Println("⏳ WS1 正在保持连接，等待 WS2 检查...")
+		
+		// 阻塞在这里，直到收到 WS2 完成的信号
+		select {
+		case <-doneSignal:
+			fmt.Println("👋 WS1 收到完成信号，准备退出")
+		case <-time.After(15 * time.Second):
+			fmt.Println("⏰ WS1 等待超时")
 		}
 	}()
 
-	// 稍微延迟一点点，确保 WS1 的 TCP 连接先跑起来
-	time.Sleep(time.Second * 1)
+	// 延迟 2 秒，确保 WS1 稳定
+	time.Sleep(2 * time.Second)
 
-	// --- 任务 2: 连接 /ws2 并发送 check ---
+	// --- WS2: 建立连接进行 check ---
 	go func() {
 		defer wg.Done()
-		opts := &websocket.DialOptions{
-			HTTPClient: hc, // 关键：复用同一个底层的 TCP/H2 连接
-		}
+		defer close(doneSignal) // 执行完后通知 WS1
 
-		c, _, err := websocket.Dial(ctx, baseURL+"/ws2", opts)
+		ctx := context.Background()
+		c, _, err := websocket.Dial(ctx, url+"/ws2", &websocket.DialOptions{HTTPClient: hc})
 		if err != nil {
 			fmt.Printf("❌ WS2 连接失败: %v\n", err)
 			return
 		}
 		defer c.Close(websocket.StatusNormalClosure, "")
 
-		// 发送 check 信号
-		err = c.Write(ctx, websocket.MessageText, []byte("check"))
-		if err != nil {
-			fmt.Printf("❌ WS2 发送失败: %v\n", err)
-			return
-		}
+		fmt.Println("📡 WS2 已连接，发送 check...")
+		wsjson.Write(ctx, c, "check")
 
-		// 读取返回的 instanceId 和 TCP 状态
-		var v interface{}
-		err = wsjson.Read(ctx, c, &v)
-		if err == nil {
-			fmt.Printf("✅ WS2 响应: %v\n", v)
+		var res interface{}
+		if err := wsjson.Read(ctx, c, &res); err == nil {
+			fmt.Printf("🎯 WS2 检查结果: %v\n", res)
 		}
 	}()
 
